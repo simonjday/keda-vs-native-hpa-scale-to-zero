@@ -1,5 +1,7 @@
 # Scale-to-Zero Lab: Native HPA vs KEDA
 
+[![GitHub](https://img.shields.io/badge/GitHub-keda--vs--native--hpa--scale--to--zero-blue?logo=github)](https://github.com/simonjday/keda-vs-native-hpa-scale-to-zero)
+
 Two fully independent kind clusters for an honest side-by-side comparison.
 
 ## Why Two Clusters?
@@ -188,3 +190,7 @@ scale-to-zero-lab/
 | native-hpa-lab | ~2.5GB | Prometheus, Grafana, Prometheus Adapter |
 | keda-lab | ~2.5GB | Prometheus, Grafana, KEDA |
 | Both | ~5GB | Set Docker Desktop memory to ≥6GB |
+
+---
+
+**Repo:** https://github.com/simonjday/keda-vs-native-hpa-scale-to-zero
