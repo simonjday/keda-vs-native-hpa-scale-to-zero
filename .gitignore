@@ -1,6 +1,6 @@
 # Kind config files (generated at runtime)
 scripts/kind-config-*.yaml
-
+scripts/add-grafana.sh
 # Kubeconfig backups
 *.yaml.bak
 
