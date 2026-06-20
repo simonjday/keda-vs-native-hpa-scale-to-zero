@@ -1,0 +1,18 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: fake-metrics-keda
+  namespace: demo-keda
+  labels:
+    release: prometheus
+spec:
+  namespaceSelector:
+    matchNames:
+      - demo-keda
+  selector:
+    matchLabels:
+      app: fake-metrics
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s

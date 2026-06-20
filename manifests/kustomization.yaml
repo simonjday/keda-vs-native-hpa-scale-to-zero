@@ -1,0 +1,12 @@
+# NOTE: This kustomization is for reference only.
+# cluster.sh applies manifests directly per-cluster using kubectl apply -f
+# to ensure the correct context is used.
+#
+# native-hpa-lab cluster:
+#   kubectl --context kind-native-hpa-lab apply -f native-hpa/
+#
+# keda-lab cluster:
+#   kubectl --context kind-keda-lab apply -f keda/
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources: []

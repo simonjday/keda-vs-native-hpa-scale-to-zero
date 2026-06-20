@@ -1,0 +1,274 @@
+---
+# ─── Grafana Dashboard: Scale-to-Zero Lab ────────────────────────────────────
+# Provisioned automatically by Grafana sidecar (grafana.sidecar.dashboards.enabled=true)
+# The sidecar watches for ConfigMaps with label grafana_dashboard: "1" and loads them.
+#
+# Apply to BOTH clusters:
+#   kubectl --context kind-native-hpa-lab apply -f manifests/grafana/dashboard-configmap.yaml
+#   kubectl --context kind-keda-lab apply -f manifests/grafana/dashboard-configmap.yaml
+#
+# Access: http://localhost:30081 (native) | http://localhost:30082 (keda)
+# Login: admin / admin
+# Dashboard: Dashboards → Scale-to-Zero Lab
+#
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: scale-to-zero-dashboard
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"   # picked up by Grafana sidecar
+data:
+  scale-to-zero.json: |
+    {
+      "title": "Scale-to-Zero Lab",
+      "uid": "scale-to-zero-lab",
+      "tags": ["keda", "hpa", "autoscaling"],
+      "timezone": "browser",
+      "refresh": "10s",
+      "time": { "from": "now-15m", "to": "now" },
+      "panels": [
+        {
+          "id": 1,
+          "title": "Queue Depth (fake-metrics)",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": { "lineWidth": 2, "fillOpacity": 10 },
+              "unit": "short",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null },
+                  { "color": "yellow", "value": 20 },
+                  { "color": "red", "value": 80 }
+                ]
+              }
+            }
+          },
+          "targets": [
+            {
+              "expr": "sum(queue_depth_total)",
+              "legendFormat": "queue depth",
+              "refId": "A"
+            }
+          ],
+          "options": {
+            "tooltip": { "mode": "single" },
+            "legend": { "displayMode": "list", "placement": "bottom" }
+          }
+        },
+        {
+          "id": 2,
+          "title": "Worker Replicas",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": { "lineWidth": 2, "fillOpacity": 10 },
+              "unit": "short",
+              "min": 0,
+              "decimals": 0
+            }
+          },
+          "targets": [
+            {
+              "expr": "kube_deployment_status_replicas_ready{deployment=~\"worker-app.*\"}",
+              "legendFormat": "{{ deployment }} ready",
+              "refId": "A"
+            },
+            {
+              "expr": "kube_deployment_spec_replicas{deployment=~\"worker-app.*\"}",
+              "legendFormat": "{{ deployment }} desired",
+              "refId": "B"
+            }
+          ],
+          "options": {
+            "tooltip": { "mode": "multi" },
+            "legend": { "displayMode": "list", "placement": "bottom" }
+          }
+        },
+        {
+          "id": 3,
+          "title": "HPA Current vs Desired Replicas",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": { "lineWidth": 2 },
+              "unit": "short",
+              "min": 0,
+              "decimals": 0
+            }
+          },
+          "targets": [
+            {
+              "expr": "kube_horizontalpodautoscaler_status_current_replicas",
+              "legendFormat": "current replicas",
+              "refId": "A"
+            },
+            {
+              "expr": "kube_horizontalpodautoscaler_status_desired_replicas",
+              "legendFormat": "desired replicas",
+              "refId": "B"
+            },
+            {
+              "expr": "kube_horizontalpodautoscaler_spec_min_replicas",
+              "legendFormat": "min replicas",
+              "refId": "C"
+            }
+          ],
+          "options": {
+            "tooltip": { "mode": "multi" },
+            "legend": { "displayMode": "list", "placement": "bottom" }
+          }
+        },
+        {
+          "id": 4,
+          "title": "Queue Depth vs Replicas (correlation)",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": { "lineWidth": 2, "fillOpacity": 5 }
+            },
+            "overrides": [
+              {
+                "matcher": { "id": "byName", "options": "queue depth" },
+                "properties": [
+                  { "id": "unit", "value": "short" },
+                  { "id": "custom.axisPlacement", "value": "left" }
+                ]
+              },
+              {
+                "matcher": { "id": "byName", "options": "ready replicas" },
+                "properties": [
+                  { "id": "unit", "value": "short" },
+                  { "id": "custom.axisPlacement", "value": "right" },
+                  { "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }
+                ]
+              }
+            ]
+          },
+          "targets": [
+            {
+              "expr": "sum(queue_depth_total)",
+              "legendFormat": "queue depth",
+              "refId": "A"
+            },
+            {
+              "expr": "kube_deployment_status_replicas_ready{deployment=~\"worker-app.*\"}",
+              "legendFormat": "ready replicas",
+              "refId": "B"
+            }
+          ],
+          "options": {
+            "tooltip": { "mode": "multi" },
+            "legend": { "displayMode": "list", "placement": "bottom" }
+          }
+        },
+        {
+          "id": 5,
+          "title": "Current Queue Depth",
+          "type": "stat",
+          "gridPos": { "h": 4, "w": 6, "x": 0, "y": 16 },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "color": { "mode": "thresholds" },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "blue", "value": null },
+                  { "color": "green", "value": 1 },
+                  { "color": "yellow", "value": 50 },
+                  { "color": "red", "value": 100 }
+                ]
+              }
+            }
+          },
+          "targets": [
+            {
+              "expr": "sum(queue_depth_total)",
+              "legendFormat": "",
+              "refId": "A"
+            }
+          ],
+          "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "orientation": "auto", "textMode": "auto", "colorMode": "background" }
+        },
+        {
+          "id": 6,
+          "title": "Ready Worker Replicas",
+          "type": "stat",
+          "gridPos": { "h": 4, "w": 6, "x": 6, "y": 16 },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "color": { "mode": "thresholds" },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "blue", "value": null },
+                  { "color": "green", "value": 1 }
+                ]
+              }
+            }
+          },
+          "targets": [
+            {
+              "expr": "sum(kube_deployment_status_replicas_ready{deployment=~\"worker-app.*\"})",
+              "legendFormat": "",
+              "refId": "A"
+            }
+          ],
+          "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "orientation": "auto", "textMode": "auto", "colorMode": "background" }
+        },
+        {
+          "id": 7,
+          "title": "HPA Min Replicas",
+          "type": "stat",
+          "gridPos": { "h": 4, "w": 6, "x": 12, "y": 16 },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "color": { "mode": "fixed", "fixedColor": "purple" }
+            }
+          },
+          "targets": [
+            {
+              "expr": "kube_horizontalpodautoscaler_spec_min_replicas",
+              "legendFormat": "",
+              "refId": "A"
+            }
+          ],
+          "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "orientation": "auto", "textMode": "auto", "colorMode": "background" }
+        },
+        {
+          "id": 8,
+          "title": "HPA Max Replicas",
+          "type": "stat",
+          "gridPos": { "h": 4, "w": 6, "x": 18, "y": 16 },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "color": { "mode": "fixed", "fixedColor": "dark-purple" }
+            }
+          },
+          "targets": [
+            {
+              "expr": "kube_horizontalpodautoscaler_spec_max_replicas",
+              "legendFormat": "",
+              "refId": "A"
+            }
+          ],
+          "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "orientation": "auto", "textMode": "auto", "colorMode": "background" }
+        }
+      ],
+      "schemaVersion": 36,
+      "version": 1
+    }

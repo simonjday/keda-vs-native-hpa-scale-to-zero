@@ -1,0 +1,37 @@
+---
+# ─── Prometheus Adapter ConfigMap ─────────────────────────────────────────────
+# Applied to: native-hpa-lab cluster ONLY
+#
+# This is the translation layer that does NOT exist in keda-lab.
+# KEDA replaces this entire file with its built-in Prometheus scaler.
+#
+# The adapter registers queue_depth_external under:
+#   /apis/external.metrics.k8s.io/v1beta1/namespaces/demo-native/queue_depth_external
+#
+# Verify it's working:
+#   kubectl --context kind-native-hpa-lab get --raw \
+#     /apis/external.metrics.k8s.io/v1beta1/namespaces/demo-native/queue_depth_external
+#
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-adapter
+  namespace: monitoring
+data:
+  config.yaml: |
+    rules:
+      # ── External metric for HPA scale-to-zero ──────────────────────────────
+      # seriesQuery: which Prometheus series to watch
+      # name.as: what to call it in the external metrics API
+      # metricsQuery: PromQL sent to Prometheus on each HPA loop
+      - seriesQuery: 'queue_depth_total{namespace!="",pod!=""}'
+        resources:
+          overrides:
+            namespace:
+              resource: namespace
+            pod:
+              resource: pod
+        name:
+          matches: "^(.*)_total"
+          as: "queue_depth_external"
+        metricsQuery: 'sum(<<.Series>>{<<.LabelMatchers>>}) by (namespace)'

@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: fake-metrics
+  namespace: demo-keda
+  labels:
+    app: fake-metrics
+spec:
+  selector:
+    app: fake-metrics
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080

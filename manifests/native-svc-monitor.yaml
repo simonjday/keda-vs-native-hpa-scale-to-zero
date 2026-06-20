@@ -1,0 +1,18 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: fake-metrics-native
+  namespace: demo-native
+  labels:
+    release: prometheus
+spec:
+  namespaceSelector:
+    matchNames:
+      - demo-native
+  selector:
+    matchLabels:
+      app: fake-metrics
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s

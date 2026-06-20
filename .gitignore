@@ -1,0 +1,15 @@
+# Kind config files (generated at runtime)
+scripts/kind-config-*.yaml
+
+# Kubeconfig backups
+*.yaml.bak
+
+# Benchmark results (generated output)
+benchmark-results-*.json
+
+# macOS
+.DS_Store
+
+# Docs drafts (not for repo)
+docs/medium-post.md
+docs/linkedin-post.md

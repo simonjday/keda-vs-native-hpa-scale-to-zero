@@ -1,0 +1,149 @@
+---
+# ─── Worker App — realistic implementation ────────────────────────────────────
+# Adapted from: github.com/rushi2828/keda-vs-k8s-scale-to-zero
+# That repo uses a real SQS-backed Python worker with proper SIGTERM handling,
+# rolling update strategy, and topologySpreadConstraints.
+#
+# This version replaces SQS with a local queue simulation so the lab runs
+# entirely inside kind with no AWS credentials required. The worker behaviour
+# (SIGTERM handling, batch processing, graceful drain) is preserved faithfully.
+#
+# To adapt back to SQS: swap the QUEUE_TYPE env and the boto3 backend.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: worker-config
+  namespace: demo-native
+data:
+  QUEUE_TYPE: "prometheus"         # "prometheus" for this lab; "sqs" for AWS
+  BATCH_SIZE: "10"
+  SIMULATED_WORK_MS: "500"        # ms of simulated processing per "message"
+  LOG_LEVEL: "INFO"
+  POLL_INTERVAL_S: "2"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker-app
+  namespace: demo-native
+  labels:
+    app: worker-app
+  annotations:
+    # Documents the autoscaler relationship — useful for ops visibility
+    autoscaling.kubernetes.io/managed-by: "HPA/worker-app-hpa"
+spec:
+  # IMPORTANT: Start at 1, not 0.
+  # ScaledToZero condition (KEP-2021) requires the HPA to have
+  # previously scaled down this deployment. A deployment bootstrapped
+  # at 0 replicas with a fresh HPA has no condition and will never wake.
+  replicas: 1
+  selector:
+    matchLabels:
+      app: worker-app
+  # Keep maxUnavailable: 0 — never drop below 1 during rolling update.
+  # This matters when HPA is actively managing replicas.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: worker-app
+        version: v1
+    spec:
+      # Give the worker time to finish its current batch before termination.
+      # Must be > BATCH_SIZE * SIMULATED_WORK_MS to avoid mid-batch kills.
+      terminationGracePeriodSeconds: 30
+
+      containers:
+        - name: worker
+          image: python:3.12-alpine
+          # Pure stdlib — no pip install, no network calls, no AWS SDK
+          command: ["python3", "-c"]
+          args:
+            - |
+              import os, time, signal, sys, logging, random
+
+              logging.basicConfig(
+                  level=os.environ.get("LOG_LEVEL", "INFO"),
+                  format="%(asctime)s [%(levelname)s] %(message)s"
+              )
+              log = logging.getLogger("worker")
+
+              BATCH       = int(os.environ.get("BATCH_SIZE", "10"))
+              WORK_MS     = int(os.environ.get("SIMULATED_WORK_MS", "500"))
+              POLL_S      = float(os.environ.get("POLL_INTERVAL_S", "2"))
+              running     = True
+
+              def shutdown(sig, frame):
+                  global running
+                  log.info(f"Signal {sig} received — finishing current batch then exiting")
+                  running = False
+
+              signal.signal(signal.SIGTERM, shutdown)
+              signal.signal(signal.SIGINT,  shutdown)
+
+              log.info(f"Worker started. batch={BATCH} work={WORK_MS}ms poll={POLL_S}s")
+
+              while running:
+                  # Simulate polling a queue
+                  batch_size = random.randint(1, BATCH)
+                  log.info(f"Processing batch of {batch_size} items")
+                  for i in range(batch_size):
+                      time.sleep(WORK_MS / 1000)
+                      log.debug(f"  item {i+1}/{batch_size} done")
+                  log.info(f"Batch complete. Sleeping {POLL_S}s")
+                  # Sleep in small increments so SIGTERM is handled quickly
+                  deadline = time.time() + POLL_S
+                  while running and time.time() < deadline:
+                      time.sleep(0.1)
+
+              log.info("Worker shut down cleanly")
+              sys.exit(0)
+
+          envFrom:
+            - configMapRef:
+                name: worker-config
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
+
+          livenessProbe:
+            exec:
+              command: ["python3", "-c", "import sys; sys.exit(0)"]
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            failureThreshold: 3
+
+          readinessProbe:
+            exec:
+              command: ["python3", "-c", "import sys; sys.exit(0)"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+
+      # Spread replicas across nodes when N > 1 (defensive, kind has 2 workers)
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: worker-app

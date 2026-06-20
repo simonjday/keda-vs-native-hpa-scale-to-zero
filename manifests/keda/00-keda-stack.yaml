@@ -1,0 +1,244 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo-keda
+  labels:
+    demo: keda-scale-to-zero
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fake-metrics
+  namespace: demo-keda
+  labels:
+    app: fake-metrics
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fake-metrics
+  template:
+    metadata:
+      labels:
+        app: fake-metrics
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: metrics
+          image: python:3.12-alpine
+          command: ["python3", "-c"]
+          args:
+            - |
+              import http.server, threading, os
+              queue_depth = float(os.environ.get("INITIAL_QUEUE_DEPTH", "10"))
+              lock = threading.Lock()
+              PORT = 8080
+              ns  = os.environ.get("POD_NAMESPACE", "demo-keda")
+              pod = os.environ.get("POD_NAME", "fake-metrics")
+              class H(http.server.BaseHTTPRequestHandler):
+                  def log_message(self, *a): pass
+                  def do_GET(self):
+                      global queue_depth
+                      if self.path == "/health":
+                          self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
+                      elif self.path == "/metrics":
+                          with lock: v = queue_depth
+                          body = ("# HELP queue_depth_total Queue depth\n"
+                                  "# TYPE queue_depth_total gauge\n"
+                                  "queue_depth_total{namespace=\"%s\",pod=\"%s\"} %s\n" % (ns, pod, v))
+                          b = body.encode()
+                          self.send_response(200)
+                          self.send_header("Content-Type", "text/plain; version=0.0.4")
+                          self.send_header("Content-Length", str(len(b)))
+                          self.end_headers(); self.wfile.write(b)
+                      elif self.path.startswith("/set"):
+                          from urllib.parse import urlparse, parse_qs
+                          qs = parse_qs(urlparse(self.path).query)
+                          with lock: queue_depth = float(qs["queue_depth"][0])
+                          self.send_response(200); self.end_headers()
+                          self.wfile.write(("ok %s" % queue_depth).encode())
+                      else:
+                          self.send_response(404); self.end_headers()
+              http.server.ThreadingHTTPServer(("", PORT), H).serve_forever()
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef: {fieldPath: metadata.namespace}
+            - name: POD_NAME
+              valueFrom:
+                fieldRef: {fieldPath: metadata.name}
+            - name: INITIAL_QUEUE_DEPTH
+              value: "10"
+          ports:
+            # Named port — required by ServiceMonitor port: http reference
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet: {path: /health, port: 8080}
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits:   {cpu: 100m, memory: 64Mi}
+
+---
+# Service with named port matching ServiceMonitor endpoint
+apiVersion: v1
+kind: Service
+metadata:
+  name: fake-metrics
+  namespace: demo-keda
+  labels:
+    app: fake-metrics
+spec:
+  selector:
+    app: fake-metrics
+  ports:
+    - name: http          # must match ServiceMonitor endpoints[].port
+      port: 8080
+      targetPort: 8080
+
+---
+# ServiceMonitor references port by name, not number
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: fake-metrics-keda
+  namespace: demo-keda
+  labels:
+    release: prometheus   # matches kube-prometheus-stack serviceMonitorSelector
+spec:
+  namespaceSelector:
+    matchNames:
+      - demo-keda
+  selector:
+    matchLabels:
+      app: fake-metrics
+  endpoints:
+    - port: http          # named port reference — matches Service.spec.ports[].name
+      path: /metrics
+      interval: 15s
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: worker-config
+  namespace: demo-keda
+data:
+  BATCH_SIZE: "10"
+  SIMULATED_WORK_MS: "500"
+  LOG_LEVEL: "INFO"
+  POLL_INTERVAL_S: "2"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker-app-keda
+  namespace: demo-keda
+  labels:
+    app: worker-app-keda
+  annotations:
+    keda.sh/managed-by: "ScaledObject/worker-app-keda-so"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: worker-app-keda
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: worker-app-keda
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: worker
+          image: python:3.12-alpine
+          command: ["python3", "-c"]
+          args:
+            - |
+              import os, time, signal, sys, logging, random
+              logging.basicConfig(level=os.environ.get("LOG_LEVEL","INFO"),
+                                  format="%(asctime)s [%(levelname)s] %(message)s")
+              log = logging.getLogger("worker-keda")
+              BATCH   = int(os.environ.get("BATCH_SIZE", "10"))
+              WORK_MS = int(os.environ.get("SIMULATED_WORK_MS", "500"))
+              POLL_S  = float(os.environ.get("POLL_INTERVAL_S", "2"))
+              running = True
+              def shutdown(sig, frame):
+                  global running
+                  log.info("Signal %s — finishing batch then exiting" % sig)
+                  running = False
+              signal.signal(signal.SIGTERM, shutdown)
+              signal.signal(signal.SIGINT, shutdown)
+              log.info("Worker started. batch=%s work=%sms" % (BATCH, WORK_MS))
+              while running:
+                  n = random.randint(1, BATCH)
+                  log.info("Processing %s items" % n)
+                  for i in range(n):
+                      time.sleep(WORK_MS / 1000)
+                  deadline = time.time() + POLL_S
+                  while running and time.time() < deadline:
+                      time.sleep(0.1)
+              log.info("Clean shutdown")
+              sys.exit(0)
+          envFrom:
+            - configMapRef:
+                name: worker-config
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits:   {cpu: 200m, memory: 128Mi}
+          readinessProbe:
+            exec:
+              command: ["python3", "-c", "import sys; sys.exit(0)"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: worker-app-keda-so
+  namespace: demo-keda
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: worker-app-keda
+  minReplicaCount: 0
+  maxReplicaCount: 10
+  pollingInterval: 15
+  cooldownPeriod: 30
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 0
+          policies:
+            - type: Pods
+              value: 5
+              periodSeconds: 15
+        scaleDown:
+          stabilizationWindowSeconds: 30
+          policies:
+            - type: Pods
+              value: 10
+              periodSeconds: 15
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus-kube-prometheus-prometheus.monitoring.svc:9090
+        query: sum(queue_depth_total{namespace="demo-keda"})
+        threshold: "20"
+        activationThreshold: "1"

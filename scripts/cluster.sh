@@ -1,0 +1,559 @@
+#!/usr/bin/env bash
+# =============================================================================
+# cluster.sh — Two-cluster scale-to-zero lab manager
+#
+# CLUSTER 1: native-hpa-lab  — Prometheus + Prometheus Adapter + native HPA
+# CLUSTER 2: keda-lab        — Prometheus + KEDA
+#
+# Each cluster is fully independent. No shared components. Honest comparison.
+#
+# Usage:
+#   ./cluster.sh up [native|keda|both]   # default: both
+#   ./cluster.sh down [native|keda|both]
+#   ./cluster.sh nuke [native|keda|both]
+#   ./cluster.sh status
+#   ./cluster.sh logs [native|keda] [hpa|adapter|keda|keda-metrics]
+#
+# Resource requirements (approximate):
+#   native-hpa-lab: ~2GB RAM, 2 CPU
+#   keda-lab:       ~2.5GB RAM, 2 CPU
+#   Both together:  ~4.5GB RAM — ensure Docker Desktop has ≥6GB allocated
+# =============================================================================
+set -euo pipefail
+
+# ── Cluster identities ────────────────────────────────────────────────────────
+NATIVE_CLUSTER="native-hpa-lab"
+KEDA_CLUSTER="keda-lab"
+K8S_VERSION="v1.36.1"
+KEDA_VERSION="2.16.0"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LAB_DIR="$(dirname "$SCRIPT_DIR")"
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+info()    { echo -e "${BLUE}[INFO]${NC}  $*"; }
+success() { echo -e "${GREEN}[OK]${NC}    $*"; }
+warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
+error()   { echo -e "${RED}[ERR]${NC}   $*" >&2; }
+header()  { echo -e "\n${BOLD}${CYAN}── $* ──${NC}"; }
+
+# ── Preflight ─────────────────────────────────────────────────────────────────
+check_deps() {
+  local missing=()
+  for cmd in kind kubectl helm docker; do
+    command -v "$cmd" &>/dev/null || missing+=("$cmd")
+  done
+  [[ ${#missing[@]} -gt 0 ]] && {
+    error "Missing: ${missing[*]}"
+    echo "  brew install kind kubectl helm && brew install --cask docker"
+    exit 1
+  }
+  docker info &>/dev/null || { error "Docker not running."; exit 1; }
+}
+
+# ── Kind config writer ────────────────────────────────────────────────────────
+write_kind_config() {
+  local cluster="$1"
+  local prom_port="$2"     # NodePort for Prometheus
+  local grafana_port="$3"  # NodePort for Grafana
+  local config_file="$SCRIPT_DIR/kind-config-${cluster}.yaml"
+
+  cat > "$config_file" <<EOF
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: ${cluster}
+featureGates:
+  HPAScaleToZero: true
+nodes:
+  - role: control-plane
+    kubeadmConfigPatches:
+      - |
+        kind: ClusterConfiguration
+        apiServer:
+          extraArgs:
+            enable-aggregator-routing: "true"
+    extraPortMappings:
+      - containerPort: ${prom_port}
+        hostPort: ${prom_port}
+        protocol: TCP
+      - containerPort: ${grafana_port}
+        hostPort: ${grafana_port}
+        protocol: TCP
+  - role: worker
+  - role: worker
+networking:
+  podSubnet: "10.244.0.0/16"
+  serviceSubnet: "10.96.0.0/16"
+EOF
+  echo "$config_file"
+}
+
+# ── Prometheus + Grafana (shared installer, called per cluster) ───────────────
+install_prometheus() {
+  local context="$1"
+  local prom_nodeport="$2"
+  local grafana_nodeport="$3"
+  info "[$context] Installing Prometheus + Grafana…"
+
+  helm repo add prometheus-community \
+    https://prometheus-community.github.io/helm-charts --force-update >/dev/null
+  helm repo update >/dev/null
+
+  # Redirect stdout to suppress Helm post-install notes (port-forward instructions
+  # for Grafana/Prometheus are irrelevant — we use NodePort, not port-forward)
+  helm upgrade --install prometheus prometheus-community/kube-prometheus-stack \
+    --kube-context "$context" \
+    --namespace monitoring --create-namespace \
+    --set prometheus.service.type=NodePort \
+    --set prometheus.service.nodePort="${prom_nodeport}" \
+    --set grafana.enabled=true \
+    --set grafana.service.type=NodePort \
+    --set grafana.service.nodePort="${grafana_nodeport}" \
+    --set grafana.adminPassword=admin \
+    --set grafana.defaultDashboardsTimezone=browser \
+    --set grafana.sidecar.dashboards.enabled=true \
+    --set alertmanager.enabled=false \
+    --set prometheusOperator.admissionWebhooks.enabled=false \
+    --set prometheusOperator.tls.enabled=false \
+    --set kubeStateMetrics.enabled=true \
+    --set nodeExporter.enabled=false \
+    --wait --timeout 7m > /dev/null
+
+  success "[$context] Prometheus (NodePort ${prom_nodeport}) + Grafana (NodePort ${grafana_nodeport}) ready"
+  info "[$context] Grafana: admin / admin"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLUSTER 1 — native-hpa-lab
+# Components: Prometheus + Prometheus Adapter (owns external.metrics.k8s.io)
+# No KEDA anywhere in this cluster.
+# ─────────────────────────────────────────────────────────────────────────────
+create_native_cluster() {
+  header "Creating cluster: $NATIVE_CLUSTER"
+
+  if kind get clusters 2>/dev/null | grep -q "^${NATIVE_CLUSTER}$"; then
+    warn "Cluster '$NATIVE_CLUSTER' already exists — skipping create."
+    return 0
+  fi
+
+  local config_file
+  config_file=$(write_kind_config "$NATIVE_CLUSTER" 30091 30081)
+
+  kind create cluster \
+    --name "$NATIVE_CLUSTER" \
+    --image "kindest/node:${K8S_VERSION}" \
+    --config "$config_file" \
+    --wait 120s
+
+  kind get kubeconfig --name "$NATIVE_CLUSTER" \
+    > "$HOME/.kube/${NATIVE_CLUSTER}.yaml"
+
+  local ctx="kind-${NATIVE_CLUSTER}"
+
+  install_prometheus "$ctx" 30091 30081
+
+  # ── Prometheus Adapter ──────────────────────────────────────────────────────
+  # The adapter is the ONLY external metrics provider in this cluster.
+  # It translates PromQL → external.metrics.k8s.io API.
+  # This is the component KEDA replaces in the keda-lab cluster.
+  #
+  # Key Helm flags:
+  #   rules.default=false          — disable built-in CPU/mem rules (noise)
+  #   rules.external[0].*          — register queue_depth_external under
+  #                                  v1beta1.external.metrics.k8s.io
+  #                                  (NOT custom.metrics.k8s.io)
+  # Without rules.external, the adapter only registers custom.metrics.k8s.io
+  # which the HPA cannot use for scale-to-zero (needs External metric type).
+  info "[$ctx] Installing Prometheus Adapter (external metrics API)…"
+  # Write values to a temp file — avoids zsh brace/bracket glob expansion
+  # that breaks --set-string with [0] and {} characters
+  local adapter_values
+  adapter_values=$(mktemp /tmp/adapter-values-XXXXXX.yaml)
+  cat > "$adapter_values" << 'ADAPTER_VALUES_EOF'
+prometheus:
+  url: http://prometheus-kube-prometheus-prometheus.monitoring.svc
+  port: 9090
+rules:
+  default: false
+  external:
+    - seriesQuery: 'queue_depth_total{namespace!="",pod!=""}'
+      resources:
+        overrides:
+          namespace:
+            resource: namespace
+      name:
+        as: queue_depth_external
+      metricsQuery: 'sum(<<.Series>>{<<.LabelMatchers>>}) by (namespace)'
+ADAPTER_VALUES_EOF
+
+  helm upgrade --install prometheus-adapter \
+    prometheus-community/prometheus-adapter \
+    --kube-context "$ctx" \
+    --namespace monitoring \
+    --values "$adapter_values" \
+    --wait --timeout 3m > /dev/null
+  rm -f "$adapter_values"
+
+  # Verify the external APIService is registered
+  info "[$ctx] Waiting for external.metrics.k8s.io APIService…"
+  local retries=0
+  until kubectl --context "$ctx" get apiservice v1beta1.external.metrics.k8s.io &>/dev/null; do
+    retries=$((retries+1))
+    [[ $retries -gt 24 ]] && { error "external.metrics.k8s.io not registered after 120s"; exit 1; }
+    sleep 5; printf '.'
+  done
+  echo
+  success "[$ctx] Prometheus Adapter external metrics API confirmed"
+
+  # ── Demo manifests ──────────────────────────────────────────────────────────
+  info "[$ctx] Applying native HPA demo manifests…"
+  kubectl --context "$ctx" apply \
+    -f "${LAB_DIR}/manifests/native-hpa/00-native-stack.yaml"
+  kubectl --context "$ctx" apply \
+    -f "${LAB_DIR}/manifests/native-hpa/02-worker-realistic.yaml"
+
+  # ── Grafana dashboard ────────────────────────────────────────────────────────
+  info "[$ctx] Applying Grafana scale-to-zero dashboard…"
+  kubectl --context "$ctx" apply     -f "${LAB_DIR}/manifests/grafana/dashboard-configmap.yaml"
+
+  success "[$ctx] native-hpa-lab ready"
+  echo "  Prometheus: http://localhost:30091"
+  echo "  Grafana:    http://localhost:30081  (admin / admin)"
+  echo "  Dashboard:  Dashboards → Scale-to-Zero Lab"
+  echo "  External metrics: kubectl --context $ctx get --raw /apis/external.metrics.k8s.io/v1beta1"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLUSTER 2 — keda-lab
+# Components: Prometheus + KEDA (owns external.metrics.k8s.io)
+# No prometheus-adapter anywhere in this cluster.
+# ─────────────────────────────────────────────────────────────────────────────
+create_keda_cluster() {
+  header "Creating cluster: $KEDA_CLUSTER"
+
+  if kind get clusters 2>/dev/null | grep -q "^${KEDA_CLUSTER}$"; then
+    warn "Cluster '$KEDA_CLUSTER' already exists — skipping create."
+    return 0
+  fi
+
+  local config_file
+  config_file=$(write_kind_config "$KEDA_CLUSTER" 30092 30082)
+
+  kind create cluster \
+    --name "$KEDA_CLUSTER" \
+    --image "kindest/node:${K8S_VERSION}" \
+    --config "$config_file" \
+    --wait 120s
+
+  kind get kubeconfig --name "$KEDA_CLUSTER" \
+    > "$HOME/.kube/${KEDA_CLUSTER}.yaml"
+
+  local ctx="kind-${KEDA_CLUSTER}"
+
+  install_prometheus "$ctx" 30092 30082
+
+  # ── KEDA ───────────────────────────────────────────────────────────────────
+  # KEDA is the ONLY external metrics provider in this cluster.
+  # No prometheus-adapter installed — KEDA polls Prometheus directly.
+  info "[$ctx] Installing KEDA ${KEDA_VERSION}…"
+  helm repo add kedacore https://kedacore.github.io/charts --force-update >/dev/null
+  helm repo update >/dev/null
+
+  helm upgrade --install keda kedacore/keda \
+    --kube-context "$ctx" \
+    --namespace keda --create-namespace \
+    --version "$KEDA_VERSION" \
+    --set watchNamespace="" \
+    --wait --timeout 5m > /dev/null
+
+  # Verify CRDs registered before applying ScaledObject — CRD propagation can
+  # lag even after helm --wait reports success
+  info "[$ctx] Waiting for KEDA CRDs…"
+  local retries=0
+  until kubectl --context "$ctx" get crd scaledobjects.keda.sh &>/dev/null; do
+    retries=$((retries+1))
+    [[ $retries -gt 24 ]] && { error "KEDA CRDs not registered after 120s"; exit 1; }
+    sleep 5; printf '.'
+  done
+  echo
+  success "[$ctx] KEDA CRDs confirmed"
+
+  # ── Demo manifests ──────────────────────────────────────────────────────────
+  info "[$ctx] Applying KEDA demo manifests…"
+  kubectl --context "$ctx" apply \
+    -f "${LAB_DIR}/manifests/keda/00-keda-stack.yaml" || true
+  # Retry once in case ScaledObject lost the CRD race
+  if ! kubectl --context "$ctx" get scaledobject worker-app-keda-so -n demo-keda &>/dev/null; then
+    warn "[$ctx] ScaledObject not found — retrying in 5s…"
+    sleep 5
+    kubectl --context "$ctx" apply -f "${LAB_DIR}/manifests/keda/00-keda-stack.yaml"
+  fi
+
+  # ── Grafana dashboard ────────────────────────────────────────────────────────
+  info "[$ctx] Applying Grafana scale-to-zero dashboard…"
+  kubectl --context "$ctx" apply     -f "${LAB_DIR}/manifests/grafana/dashboard-configmap.yaml"
+
+  success "[$ctx] keda-lab ready"
+  echo "  Prometheus: http://localhost:30092"
+  echo "  Grafana:    http://localhost:30082  (admin / admin)"
+  echo "  Dashboard:  Dashboards → Scale-to-Zero Lab"
+  echo "  ScaledObject: kubectl --context $ctx get scaledobject -n demo-keda"
+}
+
+# ── Restart stopped cluster ───────────────────────────────────────────────────
+restart_if_stopped() {
+  local cluster="$1"
+  local stopped
+  stopped=$(docker ps -a --filter "name=${cluster}" \
+    --filter "status=exited" -q | wc -l | tr -d ' ')
+  if [[ "$stopped" -gt 0 ]]; then
+    info "Restarting stopped containers for '$cluster'…"
+    docker ps -a --filter "name=${cluster}" --filter "status=exited" -q \
+      | xargs docker start
+    local ctx="kind-${cluster}"
+    info "Waiting for API server ($ctx)…"
+    local i=0
+    until kubectl --context "$ctx" cluster-info &>/dev/null; do
+      sleep 3; printf '.'; i=$((i+1))
+      [[ $i -gt 30 ]] && { echo; error "Timeout waiting for $ctx"; return 1; }
+    done
+    echo
+    success "'$cluster' restarted."
+  fi
+}
+
+# ── UP ────────────────────────────────────────────────────────────────────────
+cmd_up() {
+  local target="${2:-both}"
+  check_deps
+
+  case "$target" in
+    native|both)
+      if kind get clusters 2>/dev/null | grep -q "^${NATIVE_CLUSTER}$"; then
+        restart_if_stopped "$NATIVE_CLUSTER"
+      else
+        create_native_cluster
+      fi
+      ;;
+  esac
+
+  case "$target" in
+    keda|both)
+      if kind get clusters 2>/dev/null | grep -q "^${KEDA_CLUSTER}$"; then
+        restart_if_stopped "$KEDA_CLUSTER"
+      else
+        create_keda_cluster
+      fi
+      ;;
+  esac
+
+  cmd_status
+}
+
+# ── DOWN ──────────────────────────────────────────────────────────────────────
+cmd_down() {
+  local target="${2:-both}"
+  [[ "$target" == "native" || "$target" == "both" ]] && \
+    docker ps --filter "name=${NATIVE_CLUSTER}" -q | xargs -r docker stop && \
+    success "native-hpa-lab stopped (state preserved)"
+  [[ "$target" == "keda" || "$target" == "both" ]] && \
+    docker ps --filter "name=${KEDA_CLUSTER}" -q | xargs -r docker stop && \
+    success "keda-lab stopped (state preserved)"
+  info "Resume with: ./cluster.sh up"
+}
+
+# ── NUKE ──────────────────────────────────────────────────────────────────────
+cmd_nuke() {
+  local target="${2:-both}"
+  warn "This will DELETE cluster(s): $target"
+  read -r -p "Type 'yes' to confirm: " confirm
+  [[ "$confirm" != "yes" ]] && { info "Aborted."; return 0; }
+
+  if [[ "$target" == "native" || "$target" == "both" ]]; then
+    kind get clusters 2>/dev/null | grep -q "^${NATIVE_CLUSTER}$" && \
+      kind delete cluster --name "$NATIVE_CLUSTER" && \
+      success "native-hpa-lab deleted."
+    rm -f "$SCRIPT_DIR/kind-config-${NATIVE_CLUSTER}.yaml" \
+          "$HOME/.kube/${NATIVE_CLUSTER}.yaml"
+  fi
+
+  if [[ "$target" == "keda" || "$target" == "both" ]]; then
+    kind get clusters 2>/dev/null | grep -q "^${KEDA_CLUSTER}$" && \
+      kind delete cluster --name "$KEDA_CLUSTER" && \
+      success "keda-lab deleted."
+    rm -f "$SCRIPT_DIR/kind-config-${KEDA_CLUSTER}.yaml" \
+          "$HOME/.kube/${KEDA_CLUSTER}.yaml"
+  fi
+}
+
+# ── STATUS ────────────────────────────────────────────────────────────────────
+cmd_status() {
+  echo
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "  Scale-to-Zero Lab — Two Cluster Status"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+  for cluster in "$NATIVE_CLUSTER" "$KEDA_CLUSTER"; do
+    echo
+    local running
+    running=$(docker ps --filter "name=${cluster}" -q | wc -l | tr -d ' ')
+    if ! kind get clusters 2>/dev/null | grep -q "^${cluster}$"; then
+      echo "  [$cluster] NOT CREATED — run: ./cluster.sh up"
+      continue
+    elif [[ "$running" -eq 0 ]]; then
+      echo "  [$cluster] STOPPED — run: ./cluster.sh up"
+      continue
+    fi
+
+    local ctx="kind-${cluster}"
+    echo "  ┌─ $cluster ─────────────────────────────────────────────"
+    echo "  │ Nodes:"
+    kubectl --context "$ctx" get nodes --no-headers 2>/dev/null \
+      | awk '{printf "  │   %-45s %s\n", $1, $2}' || true
+
+    if [[ "$cluster" == "$NATIVE_CLUSTER" ]]; then
+      echo "  │"
+      echo "  │ Prometheus Adapter (external.metrics.k8s.io owner):"
+      kubectl --context "$ctx" get deployment prometheus-adapter \
+        -n monitoring --no-headers 2>/dev/null \
+        | awk '{printf "  │   %-40s READY=%s/%s\n", $1, $2, $3}' || \
+        echo "  │   not installed"
+      echo "  │"
+      echo "  │ HPA (demo-native):"
+      kubectl --context "$ctx" get hpa -n demo-native \
+        --no-headers 2>/dev/null \
+        | awk '{printf "  │   %-30s min=%-3s max=%-3s current=%s\n", $1, $5, $6, $7}' || \
+        echo "  │   not deployed"
+      echo "  │ External metrics API:"
+      kubectl --context "$ctx" get --raw \
+        "/apis/external.metrics.k8s.io/v1beta1" 2>/dev/null \
+        | python3 -m json.tool 2>/dev/null \
+        | grep '"name"' | head -3 | awk '{printf "  │   %s\n", $0}' || \
+        echo "  │   (not ready yet)"
+      echo "  │ Prometheus: http://localhost:30091"
+      echo "  │ Grafana:    http://localhost:30081  (admin / admin)"
+    else
+      echo "  │"
+      echo "  │ KEDA (external.metrics.k8s.io owner):"
+      kubectl --context "$ctx" get pods -n keda --no-headers 2>/dev/null \
+        | awk '{printf "  │   %-45s %s\n", $1, $3}' || \
+        echo "  │   not installed"
+      echo "  │"
+      echo "  │ ScaledObject (demo-keda):"
+      kubectl --context "$ctx" get scaledobject -n demo-keda \
+        --no-headers 2>/dev/null \
+        | awk '{printf "  │   %-30s READY=%-5s ACTIVE=%s\n", $1, $4, $5}' || \
+        echo "  │   not deployed"
+      echo "  │ Prometheus: http://localhost:30092"
+      echo "  │ Grafana:    http://localhost:30082  (admin / admin)"
+    fi
+    echo "  └────────────────────────────────────────────────────────"
+  done
+  echo
+}
+
+# ── LOGS ──────────────────────────────────────────────────────────────────────
+cmd_logs() {
+  local target="${2:-native}"
+  local component="${3:-default}"
+
+  case "$target" in
+    native)
+      local ctx="kind-${NATIVE_CLUSTER}"
+      case "$component" in
+        adapter)
+          kubectl --context "$ctx" logs -n monitoring \
+            -l app.kubernetes.io/name=prometheus-adapter --tail=50 -f ;;
+        hpa|controller)
+          kubectl --context "$ctx" logs -n kube-system \
+            -l component=kube-controller-manager --tail=100 -f \
+            | grep -i "hpa\|scale\|replica\|ScaledToZero" ;;
+        *)
+          kubectl --context "$ctx" logs -n monitoring \
+            -l app.kubernetes.io/name=prometheus-adapter --tail=50 -f ;;
+      esac
+      ;;
+    keda)
+      local ctx="kind-${KEDA_CLUSTER}"
+      case "$component" in
+        keda-metrics)
+          kubectl --context "$ctx" logs -n keda \
+            -l app=keda-operator-metrics-apiserver --tail=50 -f ;;
+        *)
+          kubectl --context "$ctx" logs -n keda \
+            -l app=keda-operator --tail=50 -f ;;
+      esac
+      ;;
+    *)
+      error "Unknown target: $target. Use 'native' or 'keda'"
+      ;;
+  esac
+}
+
+# ── Port-forward (workaround for clusters created before Grafana NodePort) ────
+# kind only creates host→container port mappings at cluster creation time.
+# If Grafana was added after cluster creation, use this to access it.
+# Runs in background; kill with: pkill -f "port-forward.*grafana"
+cmd_port_forward() {
+  local target="${2:-both}"
+
+  if [[ "$target" == "native" || "$target" == "both" ]]; then
+    info "Port-forwarding native-hpa-lab Grafana → http://localhost:30081"
+    kubectl --context "kind-${NATIVE_CLUSTER}" port-forward       -n monitoring svc/prometheus-grafana 30081:80 &>/dev/null &
+    success "Grafana (native): http://localhost:30081  (admin / admin)"
+  fi
+
+  if [[ "$target" == "keda" || "$target" == "both" ]]; then
+    info "Port-forwarding keda-lab Grafana → http://localhost:30082"
+    kubectl --context "kind-${KEDA_CLUSTER}" port-forward       -n monitoring svc/prometheus-grafana 30082:80 &>/dev/null &
+    success "Grafana (keda):   http://localhost:30082  (admin / admin)"
+  fi
+
+  info "Port-forwards running in background."
+  info "Stop with: pkill -f 'port-forward.*grafana'"
+}
+
+# ── Dispatch ──────────────────────────────────────────────────────────────────
+CMD="${1:-help}"
+case "$CMD" in
+  up)     cmd_up "$@" ;;
+  down)   cmd_down "$@" ;;
+  nuke)   cmd_nuke "$@" ;;
+  status) cmd_status ;;
+  logs)   cmd_logs "$@" ;;
+  pf|port-forward)
+    cmd_port_forward "$@"
+    ;;
+  help|--help|-h)
+    cat <<'EOF'
+Usage: ./cluster.sh <command> [target]
+
+Commands:
+  up [native|keda|both]       Create clusters (default: both)
+  down [native|keda|both]     Safe stop — state preserved (default: both)
+  nuke [native|keda|both]     Delete clusters (default: both)
+  status                      Show both clusters
+  pf [native|keda|both]       Port-forward Grafana to localhost (background)
+  logs <native|keda> [component]
+    native: component = adapter | hpa
+    keda:   component = keda | keda-metrics
+
+Clusters:
+  native-hpa-lab   Prometheus + Prometheus Adapter — NO KEDA
+  keda-lab         Prometheus + KEDA              — NO adapter
+
+Access (after pf or cluster created with current cluster.sh):
+  Prometheus native: http://localhost:30091
+  Prometheus keda:   http://localhost:30092
+  Grafana native:    http://localhost:30081  (admin / admin)
+  Grafana keda:      http://localhost:30082  (admin / admin)
+
+Resource requirements:
+  Each cluster: ~2.5GB RAM
+  Both together: ~5GB RAM (set Docker Desktop to ≥6GB)
+EOF
+    ;;
+  *)
+    error "Unknown command: $CMD"; exit 1 ;;
+esac
