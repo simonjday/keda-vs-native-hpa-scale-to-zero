@@ -77,8 +77,10 @@ Both clusters have identical Scale-to-Zero Lab dashboards provisioned automatica
 
 ```bash
 # 1. Reset queues to baseline (demos leave them at 0)
-kubectl --context kind-native-hpa-lab exec -n demo-native deploy/fake-metrics --   wget -qO- "http://127.0.0.1:8080/set?queue_depth=10"
-kubectl --context kind-keda-lab exec -n demo-keda deploy/fake-metrics --   wget -qO- "http://127.0.0.1:8080/set?queue_depth=10"
+kubectl --context kind-native-hpa-lab exec -n demo-native deploy/fake-metrics -- \
+  wget -qO- "http://127.0.0.1:8080/set?queue_depth=10"
+kubectl --context kind-keda-lab exec -n demo-keda deploy/fake-metrics -- \
+  wget -qO- "http://127.0.0.1:8080/set?queue_depth=10"
 
 # 2. Wait ~60s then confirm both workloads are back at 1 replica
 kubectl --context kind-native-hpa-lab get deployment worker-app -n demo-native
@@ -162,7 +164,6 @@ Cluster created before Grafana NodePort mapping was added:
 scale-to-zero-lab/
 ├── scripts/
 │   ├── cluster.sh              # Two-cluster lifecycle manager
-│   ├── add-grafana.sh          # Add Grafana to existing clusters
 │   ├── demo-native-hpa.sh      # Native HPA guided demo
 │   ├── demo-keda.sh            # KEDA guided demo
 │   └── benchmark.sh            # Timed latency comparison
@@ -176,9 +177,7 @@ scale-to-zero-lab/
 │   └── grafana/
 │       └── dashboard-configmap.yaml       # Scale-to-Zero Lab dashboard
 └── docs/
-    ├── technical-deep-dive.md  # Full reference with real observed data
-    ├── medium-post.md          # Medium article
-    └── linkedin-post.md        # LinkedIn post
+    └── technical-deep-dive.md  # Full reference with real observed data
 ```
 
 ## Resource Requirements
