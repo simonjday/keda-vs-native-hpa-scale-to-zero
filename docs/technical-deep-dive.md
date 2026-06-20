@@ -297,7 +297,7 @@ Both clusters configured with `pollingInterval=15s`, `stabilizationWindowSeconds
 *Actual results from lab run on M3 MacBook, K8s 1.36.1, KEDA 2.16,
 `pollingInterval=15s`, `stabilizationWindowSeconds=30s`, images cached.*
 
-### Why KEDA is ~10s faster
+### Latency breakdown
 
 The latency decomposes into three components:
 
@@ -307,9 +307,7 @@ The latency decomposes into three components:
 | Metric retrieval | Prometheus → Adapter → external API → HPA | KEDA → Prometheus direct |
 | Pod startup | ~10–15s (cached image) | ~10–15s (cached image) |
 
-The key difference is the **0→1 transition**. Native HPA must wait for the HPA controller loop (fixed at 15s) to fire, then retrieve the metric through the adapter chain. KEDA's operator polls Prometheus directly and patches `.spec.replicas` to 1 immediately on the next `pollingInterval` tick — the HPA is not involved for this phase.
-
-In practice this saves ~10s: the adapter chain adds ~3–5s of latency on top of the loop, and KEDA's direct poll is slightly more responsive.
+The theoretical KEDA advantage for 0→1 is real — KEDA polls Prometheus directly and patches `.spec.replicas` immediately without waiting for the HPA loop, while native HPA also traverses the adapter chain. In practice however, both approaches are dominated by the same 15s polling cadence floor. In the actual lab run, latency was comparable: **native HPA 25.2s avg, KEDA 27.3s avg**. The variance (±5s) from where in the 15s cycle the metric lands is larger than the theoretical advantage.
 
 ### Variance
 
@@ -327,7 +325,7 @@ Results are saved to `benchmark-results-<timestamp>.json`:
 
 ```json
 {
-  "benchmark_time": "2026-06-19T16:30:00Z",
+  "benchmark_time": "2026-06-20T10:33:19Z",
   "kubernetes_version": "v1.36.1",
   "config": {
     "runs": 3,
@@ -337,19 +335,20 @@ Results are saved to `benchmark-results-<timestamp>.json`:
     "stabilization_window_seconds": 30
   },
   "native_hpa": {
-    "latencies_ms": [27500, 31200, 25800],
-    "avg_ms": 28166,
-    "min_ms": 25800,
-    "max_ms": 31200
+    "latencies_ms": [24235, 27220, 24258],
+    "avg_ms": 25237,
+    "min_ms": 24235,
+    "max_ms": 27220
   },
   "keda": {
-    "latencies_ms": [17200, 20100, 16800],
-    "avg_ms": 18033,
-    "min_ms": 16800,
-    "max_ms": 20100
+    "latencies_ms": [24261, 30425, 27297],
+    "avg_ms": 27327,
+    "min_ms": 24261,
+    "max_ms": 30425
   }
 }
 ```
+*Actual results from lab run on M3 MacBook, K8s 1.36.1, KEDA 2.16.0.*
 
 ### Notes on first-run latency
 
