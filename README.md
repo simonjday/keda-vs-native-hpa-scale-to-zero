@@ -105,9 +105,7 @@ kubectl --context kind-keda-lab get deployment worker-app-keda -n demo-keda
 *Actual results from lab run on M3 MacBook, K8s 1.36.1, KEDA 2.16,
 `pollingInterval=15s`, `stabilizationWindowSeconds=30s`, images cached.*
 
-Observed latency was comparable: ~25s avg for native HPA, ~27s avg for KEDA. Both are bounded by the 15s polling/HPA loop cadence plus pod startup. Variance of ±5s between runs reflects where in the 15s cycle the metric injection lands.
-
-Variance (min vs max) is ±5–7s depending on where in the 15s polling cycle the metric is injected. Total runtime: ~15–20 minutes for 3 runs.
+Observed latency was comparable: ~25s avg for native HPA, ~27s avg for KEDA. Both are bounded by the 15s polling/HPA loop cadence plus pod startup. Variance of ±5s between runs reflects where in the 15s cycle the metric injection lands. Total runtime: ~15–20 minutes for 3 runs.
 
 Results are saved to `benchmark-results-<timestamp>.json`.
 
@@ -191,6 +189,3 @@ scale-to-zero-lab/
 | keda-lab | ~2.5GB | Prometheus, Grafana, KEDA |
 | Both | ~5GB | Set Docker Desktop memory to ≥6GB |
 
----
-
-**Repo:** https://github.com/simonjday/keda-vs-native-hpa-scale-to-zero
