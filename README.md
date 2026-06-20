@@ -2,6 +2,8 @@
 
 [![GitHub](https://img.shields.io/badge/GitHub-keda--vs--native--hpa--scale--to--zero-blue?logo=github)](https://github.com/simonjday/keda-vs-native-hpa-scale-to-zero)
 
+![Both clusters running — different external metrics owners, no shared components](images/cluster-status.png)
+
 Two fully independent kind clusters for an honest side-by-side comparison.
 
 ## Why Two Clusters?
